@@ -1,0 +1,85 @@
+pipeline {
+    options {
+      ansiColor('xterm')
+      timestamps()
+      disableConcurrentBuilds()
+  }
+    agent {
+        kubernetes {
+            label 'terratest-automated-testing'
+            defaultContainer 'terratest'
+        }
+    }
+
+    stages {
+      stage ('Configure AWS Credentials') {
+        steps {
+            echo "Assuming IAM role ${AWS_ROLE_ARN} to Modules Testing account.."
+            sh '''
+                aws sts assume-role-with-web-identity  --role-arn $AWS_ROLE_ARN  --role-session-name jenkins-terraform-modules-tst --web-identity-token file://$AWS_WEB_IDENTITY_TOKEN_FILE  --duration-seconds 3600 > ${WORKSPACE}/irp-cred.txt
+                aws configure set aws_access_key_id "$(cat ${WORKSPACE}/irp-cred.txt | jq -r ".Credentials.AccessKeyId")" > /dev/null 2>&1
+                aws configure set aws_secret_access_key "$(cat ${WORKSPACE}/irp-cred.txt | jq -r ".Credentials.SecretAccessKey")" > /dev/null 2>&1
+                aws configure set aws_session_token "$(cat ${WORKSPACE}/irp-cred.txt | jq -r ".Credentials.SessionToken")" > /dev/null 2>&1
+                aws configure set default.region eu-west-1 > /dev/null 2>&1
+                aws sts get-caller-identity
+                '''
+        }
+        post{
+          success{
+            echo "==== IAM Role ${AWS_ROLE_ARN} assumed successfully ===="
+          }
+          failure{
+            echo "==== IAM Role ${AWS_ROLE_ARN} failed to be assumed ===="
+          }
+        }
+      }
+
+      stage ('Prepare Terraform Credentials') {
+        steps {
+            echo 'Create terraform credentials file'
+            dir("${WORKSPACE}/.terraform.d") {
+                sh '''
+                    cat << EOF > ./credentials.tfrc.json
+                    $(aws secretsmanager get-secret-value --secret-id terraform | jq -r '.SecretString')
+                    EOF
+                    '''
+            }
+        }
+        post{
+          success{
+            echo '==== Terraform credentials created successfully ===='
+          }
+          failure{
+            echo '==== Terraform credentials failed to be created ===='
+          }
+        }
+      }
+
+      stage ('run test') {
+        steps {
+            echo 'Executing test..'
+            dir("${WORKSPACE}/test") {
+                sh '''
+                  export TF_CLI_CONFIG_FILE=${WORKSPACE}/.terraform.d/credentials.tfrc.json
+                  go mod init automatic-test
+                  go test -timeout 60m
+                  '''
+            }
+        }
+        post{
+          always {
+            echo '===== Cleanup terraform dir ====='
+            dir("${WORKSPACE}/.terraform.d") {
+                deleteDir()
+            }
+          }
+          success {
+            echo '===== Test Executed Successfully ====='
+          }
+          failure {
+            echo '===== Test Failed ====='
+          }
+        }
+      }
+    }
+}
